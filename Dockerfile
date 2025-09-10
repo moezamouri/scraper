@@ -1,3 +1,4 @@
+FROM selenium/standalone-chromium:latest
 USER root
 
 # Python + Tailscale repo + Tailscale
