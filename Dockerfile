@@ -2,7 +2,7 @@ FROM selenium/standalone-chromium:latest
 
 USER root
 
-# Install Python + add Tailscale repo + install Tailscale
+# Python + Tailscale repo + Tailscale
 RUN apt-get update && \
     apt-get install -y curl gnupg python3 python3-pip && \
     curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.noarmor.gpg | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null && \
@@ -14,10 +14,23 @@ RUN apt-get update && \
 WORKDIR /app
 COPY . /app
 
-# Install Python deps
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Make entrypoint executable
-RUN chmod +x /app/entrypoint.sh
+# Make tailscale CLI talk to the same socket the daemon will use
+ENV TS_SOCKET=/var/run/tailscale/tailscaled.sock
+# Route HTTP(S) through Tailscale SOCKS5 once connected
+ENV ALL_PROXY=socks5://127.0.0.1:1055
+ENV NO_PROXY=localhost,127.0.0.1
 
-CMD ["/app/entrypoint.sh"]
+# One-shot startup: start tailscaled (userspace), wait for socket, tailscale up, then run scraper
+CMD bash -lc '\
+  set -e; \
+  if [ -z "${TAILSCALE_AUTHKEY:-}" ]; then echo "[ERROR] TAILSCALE_AUTHKEY missing"; exit 1; fi; \
+  mkdir -p /var/run/tailscale; \
+  /usr/sbin/tailscaled --tun=userspace-networking --socks5-server=localhost:1055 --state=mem: --socket="$TS_SOCKET" & \
+  for i in {1..40}; do [ -S "$TS_SOCKET" ] && break; sleep 0.25; done; \
+  if [ ! -S "$TS_SOCKET" ]; then echo "[ERROR] tailscaled socket not found at $TS_SOCKET"; exit 1; fi; \
+  tailscale up --auth-key="${TAILSCALE_AUTHKEY}" --hostname="railway-scraper" --accept-routes --accept-dns=false; \
+  tailscale status || true; \
+  exec python3 /app/scraping.py \
+'
