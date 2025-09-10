@@ -3,42 +3,34 @@ set -e
 
 echo "[INFO] Starting Container"
 
-# --- DEBUG BLOCK ---
-echo "[DEBUG] Printing all environment variables..."
-printenv
-echo "[DEBUG] Done printing environment variables."
-# -------------------
-
-# Check for Tailscale Auth Key
+# Check if TAILSCALE_AUTHKEY is set
 if [ -z "$TAILSCALE_AUTHKEY" ]; then
   echo "[ERROR] TAILSCALE_AUTHKEY is not set inside container!"
   exit 1
 else
-  echo "[INFO] TAILSCALE_AUTHKEY is present (length: ${#TAILSCALE_AUTHKEY})"
+  echo "[INFO] TAILSCALE_AUTHKEY detected (length: ${#TAILSCALE_AUTHKEY})"
 fi
 
-# Start Tailscale in userspace networking mode
-echo "[INFO] Starting Tailscale..."
-/usr/sbin/tailscaled --state=mem: --socket=/tmp/tailscaled.sock &
+# Start tailscaled in userspace networking mode (no kernel modules needed)
+echo "[INFO] Starting Tailscale (userspace networking mode)..."
+/usr/sbin/tailscaled --tun=userspace-networking --socks5-server=localhost:1055 --state=mem: --socket=/tmp/tailscaled.sock &
 sleep 5
 
+# Authenticate with the key
+echo "[INFO] Bringing up Tailscale..."
 /usr/bin/tailscale up \
   --authkey="${TAILSCALE_AUTHKEY}" \
   --hostname="railway-scraper" \
   --accept-routes \
   --accept-dns=false \
-  --socket=/tmp/tailscaled.sock
+  --socket=/tmp/tailscaled.sock || {
+    echo "[ERROR] tailscale up failed"
+    exit 1
+  }
 
-if [ $? -ne 0 ]; then
-  echo "[ERROR] Failed to bring up Tailscale!"
-  exit 1
-fi
+echo "[INFO] Tailscale started successfully."
 
-echo "[INFO] Tailscale started successfully!"
-tailscale ip -4
-tailscale ip -6
-
-# Run your Python scraper
+# Start your scraper
 echo "[INFO] Launching scraper..."
 exec python3 /app/scraping.py
 
