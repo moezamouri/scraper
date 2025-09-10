@@ -11,24 +11,29 @@ else
   echo "[INFO] TAILSCALE_AUTHKEY detected (length: ${#TAILSCALE_AUTHKEY})"
 fi
 
-# Start tailscaled in userspace networking mode (no kernel modules needed)
-echo "[INFO] Starting Tailscale (userspace networking mode)..."
-/usr/sbin/tailscaled --tun=userspace-networking --socks5-server=localhost:1055 --state=mem: --socket=/tmp/tailscaled.sock &
+# Start tailscaled in userspace networking mode
+echo "[INFO] Starting Tailscale daemon..."
+/usr/sbin/tailscaled \
+  --tun=userspace-networking \
+  --socks5-server=localhost:1055 \
+  --state=mem: \
+  --socket=/tmp/tailscaled.sock &
+
 sleep 5
 
 # Authenticate with the key
-echo "[INFO] Bringing up Tailscale..."
+echo "[INFO] Running 'tailscale up'..."
 /usr/bin/tailscale up \
-  --authkey="${TAILSCALE_AUTHKEY}" \
+  --auth-key="${TAILSCALE_AUTHKEY}" \
   --hostname="railway-scraper" \
   --accept-routes \
-  --accept-dns=false \
-  --socket=/tmp/tailscaled.sock || {
+  --accept-dns=false || {
     echo "[ERROR] tailscale up failed"
     exit 1
   }
 
-echo "[INFO] Tailscale started successfully."
+echo "[INFO] ✅ Tailscale connected."
+/usr/bin/tailscale status || true
 
 # Start your scraper
 echo "[INFO] Launching scraper..."
