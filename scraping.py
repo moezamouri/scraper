@@ -14,6 +14,7 @@ from selenium.webdriver.common.keys import Keys
 
 HA_URL = os.getenv("HA_URL", "http://100.67.69.31:8123")
 HA_TOKEN = os.getenv("HA_TOKEN")
+HA_PROXY_URL = os.getenv("HA_PROXY_URL")  # e.g. socks5h://127.0.0.1:1055
 
 # New-style SolarWeb defaults (kept for compatibility)
 LOGIN_URL = os.getenv("LOGIN_URL", "https://www.solarweb.com/Account/SignIn")
@@ -70,7 +71,14 @@ def ha_set_state(entity_id, value):
     }
     data = {"state": str(value)}
     try:
-        r = requests.post(url, headers=headers, json=data, timeout=10)
+        kwargs = {"headers": headers, "json": data, "timeout": 10}
+        if HA_PROXY_URL:
+            # Per-request SOCKS proxy just for HA calls
+            kwargs["proxies"] = {
+                "http": HA_PROXY_URL,
+                "https": HA_PROXY_URL,
+            }
+        r = requests.post(url, **kwargs)
         r.raise_for_status()
         log(f"✓ Updated {entity_id} = {value}")
     except Exception as e:
