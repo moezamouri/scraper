@@ -18,9 +18,13 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 
 # Make tailscale CLI talk to the same socket the daemon will use
 ENV TS_SOCKET=/var/run/tailscale/tailscaled.sock
-# Route HTTP(S) through Tailscale SOCKS5 once connected
-ENV ALL_PROXY=socks5://127.0.0.1:1055
-ENV NO_PROXY=localhost,127.0.0.1
+
+# Optional global proxy; don't force Chrome proxy (script controls via PROXY_URL)
+# Keep ALL_PROXY unset by default; user can enable if needed at deploy time
+# ENV ALL_PROXY=socks5://127.0.0.1:1055
+
+# Never proxy local and solarweb domains (bypass proxy if ALL_PROXY is set externally)
+ENV NO_PROXY=localhost,127.0.0.1,solarweb.com,.solarweb.com
 
 # One-shot startup: start tailscaled (userspace), wait for socket, tailscale up, then run scraper
 CMD bash -lc '\
