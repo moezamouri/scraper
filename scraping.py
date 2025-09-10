@@ -1,19 +1,31 @@
 import os
 import time
 import traceback
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.keys import Keys
 
 
 HA_URL = os.getenv("HA_URL", "http://100.67.69.31:8123")
 HA_TOKEN = os.getenv("HA_TOKEN")
+
+# New-style SolarWeb defaults (kept for compatibility)
 LOGIN_URL = os.getenv("LOGIN_URL", "https://www.solarweb.com/Account/SignIn")
-USERNAME = os.getenv("USERNAME", "magnus.moehrlein@gmail.com")
-PASSWORD = os.getenv("PASSWORD", "Magnus2003!")
+USERNAME = os.getenv("USERNAME")
+PASSWORD = os.getenv("PASSWORD")
+
+# Old working flow env (Fronius login + direct PV page)
+EMAIL = os.getenv("EMAIL")
+PV_SYSTEM_URL = os.getenv(
+    "PV_SYSTEM_URL",
+    "https://www.solarweb.com/PvSystems/PvSystem?pvSystemId=a2064e7f-807b-4ec8-99e2-d271da292275"
+)
 
 # Sensor names in Home Assistant
 SENSOR_PRODUCTION = "sensor.pv_production"
@@ -22,6 +34,10 @@ SENSOR_GRID = "sensor.grid_export"
 
 # Optional proxy control
 PROXY_URL = os.getenv("PROXY_URL")  # e.g. socks5://127.0.0.1:1055
+
+# Scrape interval
+SCRAPE_INTERVAL_SEC = int(os.getenv("SCRAPE_INTERVAL_SEC", "5"))
+SHORT_WAIT, MED_WAIT, LONG_WAIT = 5, 20, 40
 
 
 def log(msg):
@@ -156,7 +172,7 @@ def _find_login_fields(driver, quick=False):
     return None, None, None
 
 
-def do_login(driver):
+def do_login_solarweb(driver):
     log("Navigating to login page…")
     driver.get(LOGIN_URL)
 
@@ -228,30 +244,122 @@ def scrape_values(driver):
         return None, None, None
 
 
+# ───────────────────────────────────────────────
+# Fronius flow (working version you shared)
+# ───────────────────────────────────────────────
+def do_login_fronius(driver):
+    log("Navigating to login page…")
+    driver.get(os.getenv("FRONIUS_LOGIN_URL", "https://login.fronius.com"))
+    WebDriverWait(driver, MED_WAIT).until(EC.element_to_be_clickable((By.ID, "usernameUserInput"))).send_keys(EMAIL)
+    pwd = WebDriverWait(driver, MED_WAIT).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='password']")))
+    pwd.send_keys(PASSWORD)
+    pwd.send_keys(Keys.RETURN)
+    log("Submitted login form.")
+    time.sleep(5)
+
+
+def open_pv(driver):
+    log("Opening PV system page…")
+    driver.get(PV_SYSTEM_URL)
+    WebDriverWait(driver, LONG_WAIT).until(EC.presence_of_element_located((By.ID, "powerWidget")))
+    log("✓ PV system page loaded.")
+
+
+JS_EXTRACT = r"""
+function extract() {
+  const txt = document.body.innerText;
+
+  const prodMatch = /(\d+(?:[.,]\d+)?)\s*(kW|W)\s+of solar energy is produced/i.exec(txt);
+  const gridMatch = /(\d+(?:[.,]\d+)?)\s*(kW|W)\s+are being fed into the grid/i.exec(txt);
+  const consMatch = /consumption is\s+(\d+(?:[.,]\d+)?)\s*(kW|W)/i.exec(txt);
+
+  function toWatts(numStr, unit){
+    if(!numStr) return null;
+    let v = parseFloat(numStr.replace(',','.'));
+    if(isNaN(v)) return null;
+    if(unit.toLowerCase() === 'kw') v *= 1000;
+    return v;
+  }
+
+  const prod = prodMatch ? toWatts(prodMatch[1], prodMatch[2]) : null;
+  const grid = gridMatch ? toWatts(gridMatch[1], gridMatch[2]) : null;
+  const cons = consMatch ? toWatts(consMatch[1], consMatch[2]) : null;
+
+  return { production: prod, gridFeedIn: grid, consumption: cons };
+}
+return extract();
+"""
+
+
+def scrape_once(driver):
+    data = driver.execute_script(JS_EXTRACT)
+    prod, grid, cons = data.get("production"), data.get("gridFeedIn"), data.get("consumption")
+    log(f"DEBUG: prod={prod} | grid={grid} | cons={cons}")
+    return prod, grid, cons
+
+
+# ───────────────────────────────────────────────
+# Dummy HTTP server for liveness
+# ───────────────────────────────────────────────
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+
+def run_dummy_server():
+    try:
+        server = HTTPServer(("0.0.0.0", 8080), DummyHandler)
+        server.serve_forever()
+    except Exception:
+        pass
+
+
 def main():
+    # Background liveness server
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+
     driver = make_driver()
     try:
-        do_login(driver)
-        log("✓ Entering scrape loop every 5s")
-
-        while True:
-            try:
-                prod, cons, grid = scrape_values(driver)
-                log(f"DEBUG: prod={prod} | grid={grid} | cons={cons}")
-
-                if prod is not None:
-                    ha_set_state(SENSOR_PRODUCTION, prod)
-                if cons is not None:
-                    ha_set_state(SENSOR_CONSUMPTION, cons)
-                if grid is not None:
-                    ha_set_state(SENSOR_GRID, grid)
-
-            except Exception as e:
-                log(f"✖ Fatal error: {e}")
-                traceback.print_exc()
-                break
-
-            time.sleep(5)
+        # Choose flow: prefer Fronius flow if EMAIL provided; else SolarWeb generic
+        if EMAIL:
+            do_login_fronius(driver)
+            open_pv(driver)
+            log(f"✓ Entering scrape loop every {SCRAPE_INTERVAL_SEC}s")
+            while True:
+                try:
+                    prod, grid, cons = scrape_once(driver)
+                    if prod is not None:
+                        ha_set_state(SENSOR_PRODUCTION, prod)
+                    if cons is not None:
+                        ha_set_state(SENSOR_CONSUMPTION, cons)
+                    if grid is not None:
+                        ha_set_state(SENSOR_GRID, grid)
+                except Exception as e:
+                    log(f"✖ Fatal error: {e}")
+                    traceback.print_exc()
+                    break
+                time.sleep(SCRAPE_INTERVAL_SEC)
+        else:
+            # SolarWeb generic
+            do_login_solarweb(driver)
+            log(f"✓ Entering scrape loop every {SCRAPE_INTERVAL_SEC}s")
+            while True:
+                try:
+                    prod, cons, grid = scrape_values(driver)
+                    log(f"DEBUG: prod={prod} | grid={grid} | cons={cons}")
+                    if prod is not None:
+                        ha_set_state(SENSOR_PRODUCTION, prod)
+                    if cons is not None:
+                        ha_set_state(SENSOR_CONSUMPTION, cons)
+                    if grid is not None:
+                        ha_set_state(SENSOR_GRID, grid)
+                except Exception as e:
+                    log(f"✖ Fatal error: {e}")
+                    traceback.print_exc()
+                    break
+                time.sleep(SCRAPE_INTERVAL_SEC)
 
     finally:
         log("Interrupted. Exiting…")
