@@ -1,50 +1,45 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "[init] starting tailscaled…"
+# ---- Start tailscaled in userspace with local SOCKS5 on 1055, memory state ----
 /usr/sbin/tailscaled \
-  --tun="${TS_TUN:-userspace-networking}" \
+  --tun=userspace-networking \
   --socks5-server=localhost:1055 \
-  --state="${TS_STATE:-mem:}" \
-  --socket="${TS_SOCKET:-/var/run/tailscale/tailscaled.sock}" &
+  --state=mem: \
+  --verbose=1 &
 
-# wait for tailscaled to be ready for CLI
-for i in {1..30}; do
-  if tailscale status >/dev/null 2>&1; then break; fi
-  sleep 0.3
-done
+# Wait for tailscaled to accept CLI
+sleep 2
 
-if [[ -z "${TAILSCALE_AUTHKEY:-}" ]]; then
-  echo "[fatal] TAILSCALE_AUTHKEY is not set"; exit 1
-fi
-
-echo "[init] tailscale up…"
+# ---- Authenticate into your tailnet (ephemeral auth key) ----
 tailscale up \
   --authkey="${TAILSCALE_AUTHKEY}" \
-  --hostname="${TS_HOSTNAME:-railway-scraper}" \
-  --accept-routes \
+  --hostname="railway-scraper" \
   --accept-dns=false \
   --ssh=false
 
-echo "[info] my TS IPv4:"
-tailscale ip -4 || true
+# Wait until we actually have any peers listed (means we joined the tailnet)
+for i in {1..30}; do
+  if tailscale status --peers 2>/dev/null | grep -q .; then
+    echo "[ok] Tailscale connected."
+    break
+  fi
+  echo "[..] Waiting for Tailscale to connect..."
+  sleep 2
+done
 
-# Route all HTTP(S) via Tailscale SOCKS5 (userspace networking)
-export ALL_PROXY="socks5h://localhost:1055"
-export HTTPS_PROXY="$ALL_PROXY"
-export HTTP_PROXY="$ALL_PROXY"
-export NO_PROXY="127.0.0.1,localhost"
-
-# Optional: quick HA API probe if envs are present
-if [[ -n "${HA_BASE_URL:-}" && -n "${HA_TOKEN:-}" ]]; then
-  echo "[check] probing Home Assistant at $HA_BASE_URL"
-  if curl -sSf -H "Authorization: Bearer ${HA_TOKEN}" "${HA_BASE_URL}/api/" >/dev/null; then
-    echo "[ok] HA reachable."
+# ---- Optional: quick HA preflight over SOCKS to catch auth/network issues early ----
+if command -v curl >/dev/null 2>&1; then
+  echo "[..] Probing Home Assistant API via SOCKS..."
+  if ! curl -sS --max-time 5 --socks5-hostname 127.0.0.1:1055 \
+       -H "Authorization: Bearer ${HA_TOKEN}" \
+       "${HA_URL}/api/" >/dev/null ; then
+    echo "[warn] Preflight to HA failed (might still be booting). Continuing..."
   else
-    echo "[warn] cannot reach HA at ${HA_BASE_URL} (continuing anyway)."
+    echo "[ok] HA preflight succeeded."
   fi
 fi
 
-echo "[run] python scraping.py"
+# ---- Run your scraper ----
 exec python3 /app/scraping.py
 

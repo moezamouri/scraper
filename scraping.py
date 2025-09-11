@@ -12,7 +12,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 
 
-HA_URL = os.getenv("HA_URL", "http://100.67.69.31:8123")
+HA_URL = os.getenv("HA_URL", "http://homeassistant.tail123.ts.net:8123")
 HA_TOKEN = os.getenv("HA_TOKEN")
 HA_PROXY_URL = os.getenv("HA_PROXY_URL")  # e.g. socks5h://127.0.0.1:1055
 
@@ -30,7 +30,7 @@ PV_SYSTEM_URL = os.getenv(
 
 # Sensor names in Home Assistant
 SENSOR_PRODUCTION = "sensor.pv_production"
-SENSOR_CONSUMPTION = "sensor.pv_production2"
+SENSOR_CONSUMPTION = "sensor.pv_consumption"
 SENSOR_GRID = "sensor.grid_export"
 
 # Optional proxy control
