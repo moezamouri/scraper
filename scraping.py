@@ -30,7 +30,7 @@ PV_SYSTEM_URL = os.getenv(
 
 # Sensor names in Home Assistant
 SENSOR_PRODUCTION = "sensor.pv_production"
-SENSOR_CONSUMPTION = "sensor.pv_production2"
+SENSOR_CONSUMPTION = "sensor.pv_consumption"
 SENSOR_GRID = "sensor.grid_export"
 
 # Optional proxy control
