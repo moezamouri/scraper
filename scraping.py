@@ -64,6 +64,9 @@ def make_driver():
 
 
 def ha_set_state(entity_id, value):
+    # ensure None -> 0
+    if value is None:
+        value = 0
     url = f"{HA_URL}/api/states/{entity_id}"
     headers = {
         "Authorization": f"Bearer {HA_TOKEN}",
@@ -338,12 +341,16 @@ def main():
             while True:
                 try:
                     prod, grid, cons = scrape_once(driver)
-                    if prod is not None:
-                        ha_set_state(SENSOR_PRODUCTION, prod)
-                    if cons is not None:
-                        ha_set_state(SENSOR_CONSUMPTION, cons)
-                    if grid is not None:
-                        ha_set_state(SENSOR_GRID, grid)
+                    # None → 0 fallback
+                    if prod is None:
+                        prod = 0
+                    if cons is None:
+                        cons = 0
+                    if grid is None:
+                        grid = 0
+                    ha_set_state(SENSOR_PRODUCTION, prod)
+                    ha_set_state(SENSOR_CONSUMPTION, cons)
+                    ha_set_state(SENSOR_GRID, grid)
                 except Exception as e:
                     log(f"✖ Fatal error: {e}")
                     traceback.print_exc()
@@ -357,12 +364,16 @@ def main():
                 try:
                     prod, cons, grid = scrape_values(driver)
                     log(f"DEBUG: prod={prod} | grid={grid} | cons={cons}")
-                    if prod is not None:
-                        ha_set_state(SENSOR_PRODUCTION, prod)
-                    if cons is not None:
-                        ha_set_state(SENSOR_CONSUMPTION, cons)
-                    if grid is not None:
-                        ha_set_state(SENSOR_GRID, grid)
+                    # None → 0 fallback
+                    if prod is None:
+                        prod = 0
+                    if cons is None:
+                        cons = 0
+                    if grid is None:
+                        grid = 0
+                    ha_set_state(SENSOR_PRODUCTION, prod)
+                    ha_set_state(SENSOR_CONSUMPTION, cons)
+                    ha_set_state(SENSOR_GRID, grid)
                 except Exception as e:
                     log(f"✖ Fatal error: {e}")
                     traceback.print_exc()
