@@ -1,31 +1,22 @@
-# Base has Chromium + chromedriver preinstalled
 FROM selenium/standalone-chromium:latest
-
-# We need root to install packages and run tailscaled
 USER root
 
-# Keep Python output unbuffered; keep image small
-ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
-
-# Install Python + curl/ca-certs, then install Tailscale (auto-detects Ubuntu/Debian)
+# Install Python tooling (if not already present) + Tailscale
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        python3 python3-pip curl ca-certificates gnupg && \
-    curl -fsSL https://tailscale.com/install.sh | sh && \
+    apt-get install -y --no-install-recommends curl gnupg ca-certificates python3 python3-pip && \
+    curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.gpg | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null && \
+    curl -fsSL https://pkgs.tailscale.com/stable/debian/bookworm.list | tee /etc/apt/sources.list.d/tailscale.list >/dev/null && \
+    apt-get update && apt-get install -y --no-install-recommends tailscale && \
     rm -rf /var/lib/apt/lists/*
 
-# App setup
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip3 install --no-cache-dir -r /app/requirements.txt
 COPY . /app
-RUN chmod +x /app/entrypoint.sh
 
-# Optional: default NO_PROXY inside the container (Railway var can override)
-# If you're not setting any global proxy, this doesn't really matter.
+# Avoid any platform proxies for these hosts (belt & suspenders)
 ENV NO_PROXY=localhost,127.0.0.1,solarweb.com,.solarweb.com
 
-# Start tailscaled + bring the node up + run your scraper (handled in entrypoint.sh)
+# Use our robust entrypoint
 ENTRYPOINT ["/app/entrypoint.sh"]
 
