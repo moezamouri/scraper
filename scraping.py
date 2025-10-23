@@ -2,23 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-SolarWeb JSON API scraper → Home Assistant updater (Railway-ready)
+SolarWeb JSON scraper → Home Assistant updater (Railway-ready, robust)
 
-ENV (set in Railway):
-  # SolarWeb
-  PV_SYSTEM_ID           (preferred)  e.g. a2064e7f-807b-4ec8-99e2-d271da292275
-  PV_SYSTEM_URL          (optional; if set, ID auto-extracted from ?pvSystemId=...)
-  SCRAPE_INTERVAL_SEC    (default 30)
+ENV to set in Railway:
+  # SolarWeb (either)
+  PV_SYSTEM_ID         e.g. a2064e7f-807b-4ec8-99e2-d271da292275
+  PV_SYSTEM_URL        optional; auto-extracts ID from ?pvSystemId=...
+
+  SCRAPE_INTERVAL_SEC  default 30
 
   # Home Assistant
-  HA_URL                 e.g. http://100.67.69.31:8123
-  HA_TOKEN               (Long-Lived Access Token)
-  HA_PROXY_URL           (optional per-request proxy, e.g. socks5h://127.0.0.1:1055)
-
-Notes:
-- Uses https://www.solarweb.com/api/v1/PowerFlowRealtimeData?pvSystemId=<ID>
-- Parses Body.Data.Site.{P_PV, P_Load, P_Grid}
-- Caches last-known-good values; never overwrites sensors with 0 on fetch errors.
+  HA_URL               e.g. http://100.67.69.31:8123
+  HA_TOKEN             HA long-lived token
+  HA_PROXY_URL         optional per-request proxy (e.g. socks5h://127.0.0.1:1055)
 """
 
 import os
@@ -28,16 +24,16 @@ import json
 import traceback
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from typing import Optional, Tuple
 
 import requests
 
 
-# ────────────────────────── Config ──────────────────────────
+# ───────────────────────── Config ─────────────────────────
 HA_URL        = os.getenv("HA_URL", "http://100.67.69.31:8123")
-HA_TOKEN      = os.getenv("HA_TOKEN") or ""
-HA_PROXY_URL  = os.getenv("HA_PROXY_URL")  # optional per-request proxy for HA calls
+HA_TOKEN      = (os.getenv("HA_TOKEN") or "").strip()
+HA_PROXY_URL  = (os.getenv("HA_PROXY_URL") or "").strip() or None
 
-# Prefer explicit ID, else extract from PV_SYSTEM_URL
 PV_SYSTEM_ID  = (os.getenv("PV_SYSTEM_ID") or "").strip()
 PV_SYSTEM_URL = (os.getenv("PV_SYSTEM_URL") or "").strip()
 
@@ -47,44 +43,54 @@ SENSOR_PRODUCTION  = "sensor.pv_production"   # W
 SENSOR_CONSUMPTION = "sensor.pv_consumption"  # W
 SENSOR_GRID        = "sensor.grid_export"     # W (feed-in)
 
-# Current (2025) SolarWeb realtime endpoint
-def _api_url(pv_id: str) -> str:
-    return f"https://www.solarweb.com/api/v1/PowerFlowRealtimeData?pvSystemId={pv_id}"
+# Try endpoints in this order; first 200 wins.
+ENDPOINT_PATHS = [
+    # Most common current ones
+    "/api/PowerFlow/GetPowerFlowRealtimeData",
+    "/api/PowerFlow/PowerFlowRealtimeData",
+    "/PowerFlow/GetPowerFlowRealtimeData",
+    # Some regions/rollouts seen with this
+    "/api/v1/PowerFlowRealtimeData",
+    # Legacy
+    "/RealTimeData/GetGraphData",
+]
 
-# ────────────────────────── Helpers ─────────────────────────
+BASE = "https://www.solarweb.com"
+
+SESSION = requests.Session()
+
+
+# ───────────────────────── Utils ─────────────────────────
 def log(msg: str) -> None:
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
 def _extract_id_from_url(url: str) -> str:
-    """
-    Extract UUID from PV_SYSTEM_URL (?pvSystemId=UUID). Returns "" if not found.
-    """
     if not url:
         return ""
     m = re.search(r"pvSystemId=([0-9a-fA-F-]{36})", url)
     return m.group(1) if m else ""
 
 
-def ha_set_state(entity_id: str, value: int | None) -> None:
-    """
-    Send value to Home Assistant sensor. Skips if HA not configured or value is None.
-    """
+def _build_referer(pv_id: str) -> str:
+    return f"{BASE}/PvSystems/PvSystem?pvSystemId={pv_id}"
+
+
+def ha_set_state(entity_id: str, value: Optional[int]) -> None:
     if not HA_URL or not HA_TOKEN:
         log(f"⚠ HA not configured; skipping update for {entity_id}.")
         return
     if value is None:
         log(f"⚠ Value None for {entity_id}; skipping.")
         return
-
     url = f"{HA_URL}/api/states/{entity_id}"
     headers = {
         "Authorization": f"Bearer {HA_TOKEN}",
         "content-type": "application/json",
     }
-    data = {"state": str(int(value))}
+    payload = {"state": str(int(value))}
     try:
-        kwargs = {"headers": headers, "json": data, "timeout": 15}
+        kwargs = {"headers": headers, "json": payload, "timeout": 15}
         if HA_PROXY_URL:
             kwargs["proxies"] = {"http": HA_PROXY_URL, "https": HA_PROXY_URL}
         r = requests.post(url, **kwargs)
@@ -94,81 +100,105 @@ def ha_set_state(entity_id: str, value: int | None) -> None:
         log(f"⚠ Exception updating {entity_id}: {e}")
 
 
-# ───────────────────── SolarWeb JSON fetch ───────────────────
-SESSION = requests.Session()
-SESSION.headers.update({
-    # Be a good citizen; some CDNs require UA.
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Python/requests SolarWebScraper/1.0",
-    "Accept": "application/json, text/plain, */*",
-})
-
-def fetch_solarweb_data(pv_id: str) -> tuple[int | None, int | None, int | None]:
+# ───────────────────── SolarWeb fetch ─────────────────────
+def _parse_powerflow_site_shape(data: dict) -> Tuple[Optional[int], Optional[int], Optional[int]]:
     """
-    Returns (production_W, grid_export_W, consumption_W) or (None, None, None) on error.
-
-    JSON shape (example):
-    {
-      "Body": {
-        "Data": {
-          "Site": {
-            "P_PV": 4580,
-            "P_Load": -620,
-            "P_Grid": 3960
-          }
-        }
-      },
-      "Head": {"Status":{"Code":0}}
-    }
+    Shape:
+    {"Body":{"Data":{"Site":{"P_PV":4580,"P_Load":-620,"P_Grid":-3960}}}}
+    Return (prod, grid_export, consumption)
     """
-    try:
-        url = _api_url(pv_id)
-        r = SESSION.get(url, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-
-        # Guard: some responses nest slightly differently; be defensive.
-        site = (
-            data.get("Body", {})
-                .get("Data", {})
-                .get("Site", {})
-        )
-
-        # Production (PV), always >= 0
-        production = site.get("P_PV")
-
-        # Load: sign varies; store as absolute consumption in W
-        p_load = site.get("P_Load")
-        consumption = abs(p_load) if isinstance(p_load, (int, float)) else None
-
-        # Grid: convention can vary per firmware. We emit *export to grid*.
-        # Heuristic:
-        # - If P_Grid is negative → exporting (export = abs)
-        # - If P_Grid is positive → importing (export = 0)
-        p_grid = site.get("P_Grid")
-        grid_export = None
-        if isinstance(p_grid, (int, float)):
-            if p_grid < 0:
-                grid_export = int(abs(p_grid))
-            else:
-                grid_export = 0
-
-        # Sanitize to ints when present
-        production = int(production) if production is not None else None
-        consumption = int(consumption) if consumption is not None else None
-        grid_export = int(grid_export) if grid_export is not None else None
-
-        # Optional: raw debug to verify signs once
-        log(f"DEBUG raw site: P_PV={site.get('P_PV')} P_Load={site.get('P_Load')} P_Grid={site.get('P_Grid')}")
-
-        return production, grid_export, consumption
-
-    except Exception as e:
-        log(f"✖ Fetch error: {e}")
-        traceback.print_exc()
+    site = data.get("Body", {}).get("Data", {}).get("Site", {})
+    if not site:
         return None, None, None
 
+    # Production: non-negative
+    prod = site.get("P_PV")
+    prod = int(prod) if isinstance(prod, (int, float)) else None
 
-# ───────────────────── Liveness HTTP server ──────────────────
+    # Consumption: absolute of P_Load
+    p_load = site.get("P_Load")
+    cons = int(abs(p_load)) if isinstance(p_load, (int, float)) else None
+
+    # Grid export: positive export in W (SolarWeb sign can vary)
+    p_grid = site.get("P_Grid")
+    if isinstance(p_grid, (int, float)):
+        grid_export = int(abs(p_grid)) if p_grid < 0 else 0
+    else:
+        grid_export = None
+
+    return prod, grid_export, cons
+
+
+def _parse_legacy_flat_shape(data: dict) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """
+    Shape:
+    {"CurrentPower":4560,"Consumption":487,"GridExport":1320,...}
+    """
+    prod = data.get("CurrentPower")
+    cons = data.get("Consumption")
+    grid = data.get("GridExport")
+    prod = int(prod) if isinstance(prod, (int, float)) else None
+    cons = int(cons) if isinstance(cons, (int, float)) else None
+    grid = int(grid) if isinstance(grid, (int, float)) else None
+    return prod, grid, cons
+
+
+def fetch_solarweb_data(pv_id: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """
+    Try all known endpoints until one returns 200 and parse it.
+    Returns (production_W, grid_export_W, consumption_W) or (None,None,None).
+    """
+    # Headers that make CDNs happy
+    SESSION.headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Python/requests SolarWebScraper/1.1",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": _build_referer(pv_id),
+        "Origin": BASE,
+    })
+
+    params = {"pvSystemId": pv_id}
+
+    last_err = None
+    for path in ENDPOINT_PATHS:
+        url = f"{BASE}{path}"
+        try:
+            r = SESSION.get(url, params=params, timeout=20)
+            if r.status_code == 404:
+                # Try next known path
+                log(f"INFO: {path} → 404, trying next endpoint…")
+                continue
+            r.raise_for_status()
+
+            # Some responses are text/plain; try .json() with fallback
+            try:
+                data = r.json()
+            except json.JSONDecodeError:
+                data = json.loads(r.text)
+
+            # Try PowerFlow shape first, then legacy flat
+            prod, grid, cons = _parse_powerflow_site_shape(data)
+            if prod is None and grid is None and cons is None:
+                prod, grid, cons = _parse_legacy_flat_shape(data)
+
+            if any(v is not None for v in (prod, grid, cons)):
+                log(f"INFO: Using endpoint {path}")
+                log(f"DEBUG raw: {data if isinstance(data, dict) else 'non-dict JSON'}")
+                return prod, grid, cons
+
+            log(f"INFO: {path} returned JSON but parsers found nothing; trying next…")
+
+        except Exception as e:
+            last_err = e
+            log(f"WARN: fetch from {path} failed: {e}. Trying next…")
+
+    if last_err:
+        log(f"✖ All endpoints failed; last error: {last_err}")
+        traceback.print_exc()
+
+    return None, None, None
+
+
+# ───────────────────── Liveness HTTP ─────────────────────
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -184,18 +214,17 @@ def run_dummy_server():
         pass
 
 
-# ─────────────────────────── Main ────────────────────────────
+# ───────────────────────── Main ──────────────────────────
 def main():
     threading.Thread(target=run_dummy_server, daemon=True).start()
 
-    # Resolve PV system ID
     pv_id = PV_SYSTEM_ID or _extract_id_from_url(PV_SYSTEM_URL)
     if not pv_id:
         raise RuntimeError("Missing PV_SYSTEM_ID (or PV_SYSTEM_URL to auto-extract it).")
 
-    log(f"Starting SolarWeb API scraper (interval={SCRAPE_INTERVAL_SEC}s)")
+    log(f"Starting SolarWeb scraper (interval={SCRAPE_INTERVAL_SEC}s)")
     log(f"Target system: {pv_id}")
-    log(f"Endpoint: {_api_url(pv_id)}")
+    log(f"Referer: {_build_referer(pv_id)}")
 
     last = {"prod": None, "grid": None, "cons": None}
 
@@ -223,8 +252,11 @@ def main():
                     ha_set_state(SENSOR_GRID, grid)
                     changed = True
 
-                log(f"Current Power → Production: {last['prod']} W | Consumption: {last['cons']} W | Grid export: {last['grid']} W"
-                    + ("" if changed else " (no change)"))
+                log(
+                    f"Current Power → Production: {last['prod']} W | "
+                    f"Consumption: {last['cons']} W | Grid export: {last['grid']} W"
+                    + ("" if changed else " (no change)")
+                )
 
         except Exception as e:
             log(f"✖ Scrape cycle error: {e}")
